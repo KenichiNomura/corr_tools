@@ -39,7 +39,7 @@ typedef std::vector<std::vector<tuple_t>> nbrlist_t;
 
 #define MAX_NEIGHBOR_MOLS 5
 #define HBOND_OUTER_CUTOFF 2.1
-#define HBOND_INNER_CUTOFF 1.2
+#define HBOND_INNER_CUTOFF 1.3
 
 bool nbrlist_compare(nbrlist_t &t1, nbrlist_t &t2)
 {
@@ -180,7 +180,7 @@ struct NeighborList
 			std::vector<int> idlist; 
 			if(slist.size()==mdframe.natoms)
 			{
-				idlist = slist[i];
+				for(int j = 0; j<slist[i].size(); j++) idlist.push_back(slist[i][j]);
 			} else {
 				for(int i=0; i<mdframe.natoms; i++) idlist.push_back(i);
 			}
@@ -285,9 +285,11 @@ MDFrame read_single_mdframe(std::ifstream &in, std::string _filename="NA")
         ss << str;
 
 //        ss >> name >> x >> y >> z >> vx >> vy >> vz;
-//
-        ss >> name >> x >> y >> z >> dummy >> id;
-//        ss >> name >> x >> y >> z >> id; 
+#ifdef QMD
+        ss >> name >> x >> y >> z >> id >> dummy >> vx >> vy >> vz;
+#else
+        ss >> name >> x >> y >> z >> dummy >> id >> vx >> vy >> vz;
+#endif
         mdframe.name[id-1] = name;
         mdframe.x[id-1] = x;
         mdframe.y[id-1] = y;
@@ -340,15 +342,26 @@ public:
 		auto cpath = fs::current_path();
 		std::cout << cpath.string() << "\n";
 
-		for (auto f : fs::recursive_directory_iterator(datadir))
+		// read filelist from file or directory
+		if(fs::is_regular_file(datadir))
 		{
-			if(f.path().string().find(".xyz") != std::string::npos)
-			{
-				filepaths.push_back(f.path());
-				//std::cout << f.path().string() << "\n"; 
-			}
-		}
+			std::ifstream fin(datadir);
+			std::string line;
 
+			while(std::getline(fin,line))
+				filepaths.push_back(line);
+
+		} else {
+			for (auto f : fs::recursive_directory_iterator(datadir))
+			{
+				if(f.path().string().find(".xyz") != std::string::npos)
+				{
+					filepaths.push_back(f.path());
+					//std::cout << f.path().string() << "\n"; 
+				}
+			}
+
+		}
 		std::sort(begin(filepaths),end(filepaths), 
 			[](auto const &p1, auto const &p2) {return p1.string() < p2.string();} );
 
@@ -553,6 +566,15 @@ public:
 
 		// normalize all histograms
 		auto all_histograms = {angle_hoh_ll, angle_hoh_sl, angle_hoh_ss, angle_oho_ll, angle_oho_sl};
+
+		std::cout << "num samples "; 
+		for(auto h : all_histograms)
+		{
+			double sum = std::accumulate(h.begin(), h.end(), 0.0);
+			std::cout << sum << " ";  
+		}
+		std::cout << std::endl;
+
 		for(auto h : all_histograms)
 		{
 			std::vector<double> angle;
