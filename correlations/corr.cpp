@@ -16,6 +16,7 @@
 
 #include <boost/histogram.hpp>
 #include <boost/format.hpp>
+
 using namespace boost::histogram;
 
 namespace fs = std::filesystem;
@@ -230,6 +231,10 @@ struct NeighborList
 			for (std::vector<tuple_t> & n : list)
 				std::sort(begin(n), end(n), [](auto const & t1, auto const & t2) { return std::get<1>(t1) < std::get<1>(t2);} );
 
+		// sort nbrlist by distance
+		for (std::vector<tuple_t> & n : nbrlist)
+			std::sort(begin(n), end(n), [](auto const & t1, auto const & t2) { return std::get<0>(t1) < std::get<0>(t2);} );
+
 	}
 
 	void print()
@@ -259,11 +264,7 @@ MDFrame read_single_mdframe(std::ifstream &in, std::string _filename="NA")
     std::stringstream ss;
     std::getline(in,str);
     ss << str;
-/*
-    ss >> str >> mdframe.lattice[0] >> dummy >> dummy >>
-      dummy >> mdframe.lattice[1] >> dummy >>
-      dummy >> dummy >> mdframe.lattice[2];
-*/
+
     ss >> mdframe.lattice[0] >> mdframe.lattice[1] >> mdframe.lattice[2];
     mdframe.lattice[3] = mdframe.lattice[4] = mdframe.lattice[5] = 90.0;
 
@@ -284,7 +285,6 @@ MDFrame read_single_mdframe(std::ifstream &in, std::string _filename="NA")
         std::getline(in,str);
         ss << str;
 
-//        ss >> name >> x >> y >> z >> vx >> vy >> vz;
 #ifdef QMD
         ss >> name >> x >> y >> z >> id >> dummy >> vx >> vy >> vz;
 #else
@@ -295,23 +295,119 @@ MDFrame read_single_mdframe(std::ifstream &in, std::string _filename="NA")
         mdframe.y[id-1] = y;
         mdframe.z[id-1] = z;
         mdframe.mol_id[id-1] = id;
-
-/*
-        ss >> name >> x >> y >> z >> id;
-        
-        mdframe.name[i] = name;
-        mdframe.x[i] = x;
-        mdframe.y[i] = y;
-        mdframe.z[i] = z;
-        mdframe.mol_id[i] = id;
-*/
-
-        //std::cout << mdframe.name[i] << " " << mdframe.x[i] << " " << mdframe.y[i] << " " << mdframe.z[i] << std::endl; 
-        //std::cout << name << " " <<x << " " << y << " " << z << " " << vx << " " << vy << " " << vz << std::endl;
     }
 
     return mdframe;
 };
+
+struct hbond_populations
+{
+	const double RTW_C1 = 1.37;
+	const double RTW_C2 = -1.71;
+	const double SCW_C1 = 1.75;
+	const double SCW_C2 = -1.75;
+
+	struct hb_population
+	{
+		int num_atoms, num_frames; 
+		double C1, C2;
+		bool **hbond_map;
+
+		double q4 = 0.0;
+		long int num_q4 = 0;
+
+		void init(double _c1, double _c2, int _nf, int _na)
+		{
+			C1 = _c1; C2 = _c2;
+			num_frames = _nf; num_atoms = _na;
+
+			hbond_map = new bool * [num_frames];
+			for(int i = 0; i < num_frames; i++)
+			{
+				hbond_map[i] = new bool [num_atoms*num_atoms];
+				//for(int j = 0; j < num_atoms*num_atoms;  j++) hbond_map[i][j] = false;
+			}
+
+		};
+
+		bool check_hbonded(double dr, double cosine)
+		{
+			//std::cout << dr << " " << cosine << " " << C1 + C2*cosine << "\n"; 
+			return dr < C1 + C2*cosine;
+		};
+
+		void sample(double q4_value, int step, int jgid, int kgid)
+		{
+			hbond_map[step][jgid*num_atoms + kgid] = true;
+			q4 += q4_value;
+			num_q4++;
+		};
+
+		std::vector<double> summary(void)
+		{
+			double hbpop = q4 / num_q4;
+
+			// get number of hbonded molecules at t = 0.
+			long int num_hb0 = 0;
+			for(int idx = 0; idx < num_atoms*num_atoms; idx++)
+				if(hbond_map[0][idx] == 1) num_hb0++;
+
+			std::cout << "num_samples,<cosq+1/3>,q4 : " << num_q4 << " " << hbpop << " " << 1.0-(3.0/8.0)*hbpop << std::endl;
+
+			std::vector<double> corr;
+			for(int step = 1; step < num_frames; step++)
+			{
+				int counter = 0;
+				for(int idx = 0; idx < num_atoms*num_atoms; idx++)
+				{
+					if(hbond_map[step-1][idx] == 0) hbond_map[step][idx] == 0;
+					if(hbond_map[0][idx] == 1 && hbond_map[step][idx] == 1) counter++;
+				}
+				std::cout << step << " " << counter << " / " << num_frames << std::endl;
+				corr.push_back(counter);
+			}
+
+			return corr;
+		}
+
+	};
+
+	hb_population RTW, SCW; 
+
+	void initialize(int num_frames, int num_atoms)
+	{
+		RTW.init(RTW_C1,RTW_C2,num_frames,num_atoms);
+		SCW.init(SCW_C1,SCW_C2,num_frames,num_atoms);
+	}
+
+
+};
+
+auto prune_and_check_nbrlist_for_hbond_pops(const std::vector<tuple_t> & nbrlist)
+{
+	struct return_value
+	{
+		std::vector<tuple_t> nbr;
+		bool has_hbond = true;
+	};
+
+	return_value rv;
+
+	// ignore if the center atom is not O.
+	if (std::get<6>(nbrlist[0]).find("O") == std::string::npos) rv.has_hbond = false; 
+
+	// choose 4 nearest H.
+	for(int i = 0; i < nbrlist.size(); i++)
+	{
+		if(std::get<2>(nbrlist[i]).find("H") != std::string::npos) rv.nbr.push_back(nbrlist[i]); 
+		if(rv.nbr.size() >= 4) break;
+	}
+
+	// minimum neighbors is 3 (2 covalent + 1 hbond), otherwise ignore. 
+	if(rv.nbr.size()<3) rv.has_hbond = false; 
+
+	return rv;
+}
 
 auto angle_hoh_ll = make_histogram(axis::regular<double>(180, 0.0, 180.0));
 auto angle_hoh_sl = make_histogram(axis::regular<double>(180, 0.0, 180.0));
@@ -322,25 +418,31 @@ auto angle_oho_sl = make_histogram(axis::regular<double>(180, 0.0, 180.0));
 class hbond_stats
 {
 	std::string datadir;
+	int interval;
+
 	std::vector<fs::path> filepaths; 
 
 	NeighborList first_nbr; 
 
 	bond_stat bstat; 
 
-	std::string file_histogram, file_correlation;
+	std::string file_histogram, file_correlation, file_hbond_pairs;
 
         // num_alive_bonds, ratio, d0dt, p1, p2
 	typedef std::tuple<int, double, double, double, double> corr_t;
 	std::map<int,corr_t> corr;
 
+	hbond_populations hbpop; 
+
 public:
 
-	hbond_stats(std::string _datadir, std::string file_corr, std::string file_histo) 
-	: datadir(_datadir), file_correlation(file_corr), file_histogram(file_histo)
+	hbond_stats(std::string _datadir, int _interval, std::string file_corr, std::string file_histo, std::string file_hpair) : 
+		datadir(_datadir), interval(_interval), file_correlation(file_corr), file_histogram(file_histo), file_hbond_pairs(file_hpair)
 	{
 		auto cpath = fs::current_path();
 		std::cout << cpath.string() << "\n";
+
+		std::vector<fs::path> filepaths_all;
 
 		// read filelist from file or directory
 		if(fs::is_regular_file(datadir))
@@ -349,37 +451,43 @@ public:
 			std::string line;
 
 			while(std::getline(fin,line))
-				filepaths.push_back(line);
+				filepaths_all.push_back(line);
 
 		} else {
 			for (auto f : fs::recursive_directory_iterator(datadir))
 			{
 				if(f.path().string().find(".xyz") != std::string::npos)
 				{
-					filepaths.push_back(f.path());
+					filepaths_all.push_back(f.path());
 					//std::cout << f.path().string() << "\n"; 
 				}
 			}
 
 		}
-		std::sort(begin(filepaths),end(filepaths), 
+
+
+		std::sort(begin(filepaths_all),end(filepaths_all), 
 			[](auto const &p1, auto const &p2) {return p1.string() < p2.string();} );
 
+		for(int i = 0; i < filepaths_all.size(); i++)
+			if(i%interval == 0) filepaths.push_back(filepaths_all[i]);
 
 		// get initial frame
 		std::string filename = filepaths[0].string();
 		std::ifstream ifile(filename);	
 		MDFrame single_frame = read_single_mdframe(ifile, filename);
 		first_nbr = NeighborList(single_frame);
+
+		hbpop.initialize(filepaths.size(), single_frame.natoms);
 	}
 
-	void calc_corr(int interval)
+	void calc_corr()
 	{
 		std::ofstream fout_correlation(file_correlation);	
 
 		for (int step = 0; step<filepaths.size(); step++)
 		{
-			if(step%interval != 0) continue;
+			//if(step%interval != 0) continue;
 	
 			//std::string filename = f.string();
 			std::string filename = filepaths[step].string();
@@ -403,6 +511,7 @@ public:
 			int num_p2_step = 0;
 	
 			std::cout << filename <<  " ===========================\n";
+
 
 	//=== distribution calculations ===//
 			for (int iatom = 0; iatom< nbr.nbrlist_hcenter.size(); iatom++)
@@ -475,6 +584,56 @@ public:
 				}
 			}
 
+			// hbond population based on SCW and RTW definition
+			for (int iatom = 0; iatom< nbr.nbrlist.size(); iatom++)
+			{
+				auto n0 = nbr.nbrlist[iatom]; 
+
+				auto const & rv = prune_and_check_nbrlist_for_hbond_pops(n0);
+
+				if(! rv.has_hbond) continue;
+
+				auto const & n = rv.nbr;
+
+
+				for (int j = 0; j < n.size(); j++)
+				{
+					// pick covalent pair as j
+					if(std::get<0>(n[j]) > HBOND_INNER_CUTOFF) continue;
+
+					const int jgid = std::get<1>(n[j]);
+
+					const auto nj_r = std::get<3>(n[j]);
+					const double nj_norm = std::sqrt(nj_r.dx*nj_r.dx + nj_r.dy*nj_r.dy + nj_r.dz*nj_r.dz);
+
+					for(int k = 0; k < n.size(); k++)
+					{
+						// pick h-bond pair as k
+						if(std::get<0>(n[k]) <= HBOND_INNER_CUTOFF) continue;
+
+						const int kgid = std::get<1>(n[k]);
+
+						const auto nk_r = std::get<3>(n[k]);
+						const double nk_norm = std::sqrt(nk_r.dx*nk_r.dx + nk_r.dy*nk_r.dy + nk_r.dz*nk_r.dz);
+
+						double dot = nj_r.dx*nk_r.dx + nj_r.dy*nk_r.dy + nj_r.dz*nk_r.dz;
+						double cosine = dot/nj_norm/nk_norm;
+
+						bool is_hbonded_RTW = hbpop.RTW.check_hbonded(std::get<0>(n[k]), cosine);
+						bool is_hbonded_SCW = hbpop.SCW.check_hbonded(std::get<0>(n[k]), cosine);
+
+						double tetra_parameter = std::pow((cosine+1.0/3.0),2);
+
+						if(is_hbonded_RTW) hbpop.RTW.sample(tetra_parameter,step,jgid,kgid);
+						if(is_hbonded_SCW) hbpop.SCW.sample(tetra_parameter,step,jgid,kgid);
+
+						//std::cout << std::get<0>(n[j]) << " " << std::get<0>(n[k]) << " " << cosine << " " <<
+						//	is_hbonded_RTW << " " << is_hbonded_SCW << " " << tetra_parameter << std::endl;
+					}
+				}
+			}
+
+			//std::cout << hbpop.RTW.q4  << " " << hbpop.RTW.num_q4 << " " << hbpop.SCW.q4 << " " << hbpop.SCW.num_q4 << std::endl;
 	
 	//=== correlation calculations ===//
 			//for (auto n : nbr.nbrlist_ocenter)
@@ -512,13 +671,6 @@ public:
 							{
 								double dot = m_r.dx*n_r.dx + m_r.dy*n_r.dy + m_r.dz*n_r.dz;
 								double cosine = dot/m_norm/n_norm;
-	
-	/*
-								std::cout << std::get<1>(m[j]) << " " << std::get<1>(n[k]) << " " << 
-									m_r.dx << " " << n_r.dx << " " << 
-									m_r.dy << " " << n_r.dy << " " <<  
-									m_r.dz << " " << n_r.dz << " " << dot << std::endl;
-	*/
 	
 								d0dt_step += dot; 
 								num_d0dt_step++; 
@@ -603,6 +755,23 @@ public:
 				std::get<2>(c) << " " << std::get<3>(c) << " " << std::get<4>(c) << " " << std::endl;
 
 		fout_correlation.close();
+
+		double hbpop_RTW = hbpop.RTW.q4 / hbpop.RTW.num_q4;
+		double hbpop_SCW = hbpop.SCW.q4 / hbpop.SCW.num_q4;
+
+		//std::cout << "[RTW,SCW]_tetra_parameter " << 
+		//	hbpop_RTW << " " << hbpop_SCW << " " << 1.0-(3.0/8.0)*(hbpop_RTW) << " " << 1.0-(3.0/8.0)*(hbpop_SCW) << std::endl;
+
+		std::vector<std::vector<double>> corrs;
+		std::cout << "RTW:"; corrs.push_back(hbpop.RTW.summary());
+		std::cout << "SCW:"; corrs.push_back(hbpop.SCW.summary());
+
+		std::ofstream fout_hbond_pairs(file_hbond_pairs);
+		fout_hbond_pairs << "step, RTW_norm,  SCW_norm, RTW,  SCW" << std::endl;
+		for(int i = 0; i < corrs[0].size(); i++) fout_hbond_pairs << i*interval << " " << 
+				corrs[0][i]/corrs[0][0] << " " << corrs[1][i]/corrs[1][0] << " " << 
+				corrs[0][i] << " " << corrs[1][i] << std::endl;
+		fout_hbond_pairs.close();
 	};
 
 };
@@ -614,8 +783,8 @@ int main(int argc, char* argv[])
 
 	std::cout << "datadir, interval : " << datadir << " " << interval << std::endl << std::endl;
 
-	hbond_stats hstats(datadir, "corr.dat", "hbond.dat");
-	hstats.calc_corr(interval);
+	hbond_stats hstats(datadir, interval, "corr.dat", "hbond.dat", "hbpop.dat");
+	hstats.calc_corr();
 	hstats.save_result();
 
 	return 0;
